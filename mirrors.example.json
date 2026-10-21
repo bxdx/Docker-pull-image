@@ -1,0 +1,18 @@
+{
+  "_comment": "把这个文件改名为 mirrors.json 就会自动生效。优先级：命令行 --mirror > 本文件 > 内置默认。加 --no-builtin-mirrors 可只用本文件里的站。",
+  "_fields": {
+    "name": "显示名，随便取",
+    "url": "Registry v2 根地址，必须是 https://host 形式（末尾别带 /v2）",
+    "enabled": "false 表示临时停用这一条",
+    "upstream": "顶层可选的官方 registry，用于完整性比对"
+  },
+  "upstream": "https://registry-1.docker.io",
+  "mirrors": [
+    { "name": "daocloud",    "url": "https://docker.m.daocloud.io", "enabled": true },
+    { "name": "1ms",         "url": "https://docker.1ms.run",       "enabled": true },
+    { "name": "rat.dev",     "url": "https://hub.rat.dev",          "enabled": true },
+    { "name": "dockerproxy", "url": "https://dockerproxy.net",      "enabled": true },
+    { "name": "1panel",      "url": "https://docker.1panel.live",   "enabled": true },
+    { "name": "自建Harbor",   "url": "https://harbor.内网域名",       "enabled": false }
+  ]
+}

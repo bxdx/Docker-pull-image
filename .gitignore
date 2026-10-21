@@ -1,0 +1,43 @@
+# ---- 凭证：绝对不入库 ----
+git.prikey
+git.prikey.pub
+*.prikey
+*.prikey.pub
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.env
+
+# ---- 下载产物与中间目录 ----
+*.tar.gz
+*.tar
+*.work/
+*_blobs/
+*.part
+*.seg[0-9]*
+*.tmp
+
+# ---- 校验与运行产物 ----
+*.sha256
+*.verify.json
+*.log
+
+# ---- 本地配置（含私人镜像站地址；示例文件 mirrors.example.json 保留）----
+mirrors.json
+mirrors.local.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
