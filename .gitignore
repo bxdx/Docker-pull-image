@@ -27,6 +27,9 @@ id_ed25519*
 mirrors.json
 mirrors.local.json
 
+# ---- 测试脚本：仅本地保留，不入库 ----
+_test_*.py
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

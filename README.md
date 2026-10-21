@@ -190,19 +190,6 @@ python dip.py pull nginx:1.27 --upstream https://your-harbor    # 用内网源�
 
 ---
 
-## 测试
-
-全部用本地假 registry，不联网、不依赖第三方库：
-
-```bash
-python _test_resume.py       # 断点续传 / 凭证轮换（断言不出现从头重下的请求）
-python _test_multisource.py  # 多源分片与故障转移
-python _test_governor.py     # 源池调度与慢源剔除
-python _test_reuse.py        # 已有 blob / 已解压层的复用
-```
-
----
-
 ## 常见问题
 
 **下载很慢或频繁超时**
@@ -235,7 +222,6 @@ start-ui.bat          一键启动界面（Windows）
 start-ui.sh           一键启动界面（Linux / macOS）
 dip.py                全部实现（核心 + 命令行 + Web 界面），单文件零依赖
 mirrors.example.json  镜像站配置样例，改名为 mirrors.json 即生效
-_test_*.py            回归测试
 out/                  默认输出目录
 ```
 
