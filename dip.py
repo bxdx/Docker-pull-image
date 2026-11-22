@@ -2016,6 +2016,52 @@ def _fetch_segment(
     return added
 
 
+def _seg_prefix_bytes(dest: str, ranges: List[Tuple[int, int, int]]) -> int:
+    """返回从第 0 片起**连续完整**的分片覆盖了多少字节。"""
+    total = 0
+    for i, (_s, _e, ln) in enumerate(ranges):
+        p = dest + ".seg%02d" % i
+        if not os.path.exists(p) or os.path.getsize(p) < ln:
+            break
+        total += ln
+    return total
+
+
+def _salvage_segments_to_part(dest: str, ranges: List[Tuple[int, int, int]]) -> int:
+    """把开头连续完整的分片拼进 `<dest>.part`，供单流续传接着用。
+
+    分片是**已经下好的真实字节**，退回单流时丢掉它们就是白白重下。
+    只在拼接结果比现有 `.part` 更长时才重写；分片本身**不删**。
+    返回拼接后的 `.part` 长度（0 表示没救到任何东西）。
+    """
+    prefix = _seg_prefix_bytes(dest, ranges)
+    if prefix <= 0:
+        return 0
+    part = dest + ".part"
+    cur = os.path.getsize(part) if os.path.exists(part) else 0
+    if prefix <= cur:
+        return cur
+    tmp = part + ".salvage"
+    try:
+        with open(tmp, "wb") as out:
+            left = prefix
+            for i, (_s, _e, ln) in enumerate(ranges):
+                if left <= 0:
+                    break
+                p = dest + ".seg%02d" % i
+                with open(p, "rb") as f:
+                    shutil.copyfileobj(f, out, 1024 * 512)
+                left -= ln
+        os.replace(tmp, part)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return cur
+    return prefix
+
+
 def download_blob_multisource(
     registries: List["Registry"],
     digest: str,
@@ -2094,6 +2140,9 @@ def download_blob_multisource(
                              expected_size, max_retries, idle_timeout, names,
                              resume_cooldown=cooldown)
     seg_paths = [dest + ".seg%02d" % i for i in range(len(ranges))]
+    # 上一次运行留下的分片状态。有这个，就不能再退回单流：单流只认 `.part`，
+    # 会把已经下好的几个 GB 当成不存在 —— 实测就是这样把 83% 的进度丢掉的。
+    has_seg_state = any(os.path.exists(p) for p in seg_paths)
 
     # 源池最多管这么多站；多余的连探活都不做，避免平白占带宽
     regs = registries[:MAX_SOURCES] if len(registries) > MAX_SOURCES else registries
@@ -2112,6 +2161,14 @@ def download_blob_multisource(
             print("      %s: %d 个站不支持 Range 断点续传，已排除"
                   % (label, len(regs) - len(kept)), flush=True)
         if not kept:
+            # 一个支持 Range 的站都没有。分片没法继续往下长，但已经下好的
+            # 分片**不是垃圾**：把开头连续完整的部分拼成单流续传起点，
+            # 能救多少救多少，绝不原地清零。
+            if has_seg_state:
+                got = _salvage_segments_to_part(dest, ranges)
+                if got:
+                    print("      %s: 无站支持 Range，已把完整分片拼为单流续传起点（%s）"
+                          % (label, human_bytes(got)), flush=True)
             return download_blob(regs, digest, dest, label, progress, key,
                                  expected_size, max_retries, idle_timeout, nm,
                                  resume_cooldown=cooldown)
@@ -2123,10 +2180,14 @@ def download_blob_multisource(
             # 一起重排，否则速率会张冠李戴（快源被当成慢源、开局就歇着）。
             _sp = list(initial_speeds)
             initial_speeds = [_sp[k] if k < len(_sp) else 0.0 for k in keep_idx]
-        if len(regs) <= 1:
+        # 只剩一个支持 Range 的站时**不要退回单流**：
+        # 单流只看 .part，会把分片里的进度全部弃用。一个站照样能把分片
+        # 一片一片续完 —— 分片数和边界都没变，正是「断点续传」该有的样子。
+        if len(regs) <= 1 and not has_seg_state:
             return download_blob(regs, digest, dest, label, progress, key,
                                  expected_size, max_retries, idle_timeout, nm,
                                  resume_cooldown=cooldown)
+        n_src = max(1, min(n_src, len(regs)))
 
     # ---- 接管单流时代留下的 .part，当作前几片的已有前缀 ----
     # 不加这一步，「先单流、后分片」的模式切换会把已经下好的几百 MB 整个丢掉
@@ -2304,11 +2365,14 @@ def download_blob_multisource(
                     "sources": gov.snapshot(),
                 }
             gov.stop()
-        for p in seg_paths if unsupported.is_set() else []:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        # 下载途中所有站都退化成了「不认 Range」时，不能再像以前那样把分片
+        # 一删了之 —— 那等于把几个小时的下行流量直接倒掉。把开头连续完整的
+        # 分片拼成 `.part`，下面的单流回退就从那里接着下。
+        if unsupported.is_set():
+            got = _salvage_segments_to_part(dest, ranges)
+            if got:
+                print("      %s: 回退单流，已保留 %s 进度"
+                      % (label, human_bytes(got)), flush=True)
 
     if cancelled:
         raise Cancelled("已取消")
