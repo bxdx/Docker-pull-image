@@ -4,15 +4,19 @@
     "name": "显示名，随便取",
     "url": "Registry v2 根地址，必须是 https://host 形式（末尾别带 /v2）",
     "enabled": "false 表示临时停用这一条",
+    "proxy": "true=这条走 --proxy/环境变量里的代理；false=这条永不走代理；也可直接写成代理 URL",
     "upstream": "顶层可选的官方 registry，用于完整性比对"
   },
   "upstream": "https://registry-1.docker.io",
   "mirrors": [
-    { "name": "daocloud",    "url": "https://docker.m.daocloud.io", "enabled": true },
-    { "name": "1ms",         "url": "https://docker.1ms.run",       "enabled": true },
-    { "name": "rat.dev",     "url": "https://hub.rat.dev",          "enabled": true },
-    { "name": "dockerproxy", "url": "https://dockerproxy.net",      "enabled": true },
-    { "name": "1panel",      "url": "https://docker.1panel.live",   "enabled": true },
-    { "name": "自建Harbor",   "url": "https://harbor.内网域名",       "enabled": false }
+    { "name": "daocloud",    "url": "https://docker.m.daocloud.io", "enabled": true,  "proxy": false },
+    { "name": "1ms",         "url": "https://docker.1ms.run",       "enabled": true,  "proxy": false },
+    { "name": "rat.dev",     "url": "https://hub.rat.dev",          "enabled": true,  "proxy": false },
+    { "name": "1panel",      "url": "https://docker.1panel.live",   "enabled": true,  "proxy": false },
+    { "name": "dockerproxy", "url": "https://dockerproxy.net",      "enabled": true,  "proxy": false },
+
+    { "name": "gcr-mirror",  "url": "https://mirror.gcr.io",        "enabled": false, "proxy": true },
+
+    { "name": "自建Harbor",   "url": "https://harbor.example.internal", "enabled": false, "proxy": false }
   ]
 }

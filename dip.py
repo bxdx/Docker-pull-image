@@ -49,6 +49,10 @@ dip - Docker Image Puller
         MB 全部截断重来。这类站在多源阶段会被预先剔除，在单流阶段会被跳过。
      c) 只有「重试而毫无进展」才消耗重试预算。令牌轮换、服务端按寿命掐断连接
         这类有进展的中断不该耗尽次数，否则大层永远下不完。
+7. 代理按站决定：官方源和国外镜像站往往必须走代理，国内站走代理反而更慢。
+   --proxy 只作用于官方源，--proxy-all 才作用于镜像站；mirrors.json 里每条站
+   可写 proxy: true/false/"URL" 单独覆盖，实现「国内直连 + 国外走代理」。
+   默认不读系统代理：本机 http_proxy 常指向死端口，隐式采用会把请求全带进沟里。
 """
 
 from __future__ import annotations
@@ -75,7 +79,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 UA = "dip/%s (+docker-registry-v2-client)" % __version__
 
 # --------------------------------------------------------------------------
@@ -723,10 +727,16 @@ class Progress:
 # --------------------------------------------------------------------------
 
 class Candidate:
-    def __init__(self, name: str, url: str, official: bool = False):
+    def __init__(self, name: str, url: str, official: bool = False,
+                 proxy: Optional[str] = None, proxy_flag: Optional[bool] = None):
         self.name = name
         self.url = url
         self.official = official
+        # 配置里的 proxy 字段：具体 URL 表示这条链接走它；true 表示走命令行/环境
+        # 里的代理；false 表示永不走代理（内网站常见）；缺省则跟随全局设置。
+        self.proxy = proxy
+        self.proxy_flag = proxy_flag
+        self.effective_proxy: Optional[str] = None
         self.rtt: Optional[float] = None
         self.error: Optional[str] = None
         self.capable = False
@@ -744,12 +754,13 @@ def load_mirrors(path: Optional[str], extra: Sequence[str], no_builtin: bool) ->
     cands: List[Candidate] = []
     seen = set()
 
-    def push(name: str, url: str, official: bool = False) -> None:
+    def push(name: str, url: str, official: bool = False,
+             proxy: Optional[str] = None, proxy_flag: Optional[bool] = None) -> None:
         url = url.rstrip("/")
         if url in seen:
             return
         seen.add(url)
-        cands.append(Candidate(name, url, official))
+        cands.append(Candidate(name, url, official, proxy, proxy_flag))
 
     # 1) 命令行（优先级最高）
     for u in extra:
@@ -775,7 +786,11 @@ def load_mirrors(path: Optional[str], extra: Sequence[str], no_builtin: bool) ->
             elif isinstance(it, dict) and it.get("url"):
                 if it.get("enabled", True) is False:
                     continue
-                push(it.get("name") or it["url"], it["url"], bool(it.get("official")))
+                pv = it.get("proxy")
+                purl = pv if isinstance(pv, str) and pv else None
+                pflag = pv if isinstance(pv, bool) else None
+                push(it.get("name") or it["url"], it["url"],
+                     bool(it.get("official")), purl, pflag)
         if isinstance(data, dict) and data.get("upstream"):
             push("upstream", data["upstream"], True)
     # 3) 内置默认
@@ -787,6 +802,37 @@ def load_mirrors(path: Optional[str], extra: Sequence[str], no_builtin: bool) ->
     return cands
 
 
+def env_proxy() -> Optional[str]:
+    """从环境变量取代理。http_proxy 常被设成一个不通的地址，所以只在显式
+    要求时才读（--proxy-from-env 或 --proxy env），绝不隐式使用。"""
+    for k in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+              "all_proxy", "ALL_PROXY"):
+        v = os.environ.get(k)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
+def apply_candidate_proxy(cands: Sequence[Candidate], base_proxy: Optional[str],
+                          available_proxy: Optional[str] = None) -> None:
+    """按站点解析出各自要用的代理。
+
+    base_proxy       默认给镜像站用的代理（未加 --proxy-all 时为 None）
+    available_proxy  用户显式给出的代理，供配置里写 "proxy": true 的站单独启用
+    """
+    for c in cands:
+        if c.official:                    # 官方源始终用显式代理（正是为了翻墙）
+            c.effective_proxy = base_proxy or available_proxy or c.proxy
+        elif c.proxy:                     # 配置里写死了 URL
+            c.effective_proxy = c.proxy
+        elif c.proxy_flag is False:       # 明确不走代理
+            c.effective_proxy = None
+        elif c.proxy_flag is True:        # 明确要代理：用 --proxy，再退化到环境变量
+            c.effective_proxy = base_proxy or available_proxy or env_proxy()
+        else:
+            c.effective_proxy = base_proxy
+
+
 def handshake(c: Candidate, timeout: float) -> None:
     """探测 /v2/ 可达性与握手延迟（取两次里较快的一次）。"""
     best: Optional[float] = None
@@ -794,7 +840,7 @@ def handshake(c: Candidate, timeout: float) -> None:
     for _ in range(2):
         t0 = time.perf_counter()
         try:
-            reg = Registry(c.url, timeout=timeout, retries=1)
+            reg = Registry(c.url, timeout=timeout, retries=1, proxy=c.effective_proxy)
             try:
                 r = reg._open("GET", c.url + "/v2/")
                 r.read()
@@ -817,7 +863,7 @@ def qualify(c: Candidate, image: ImageRef, remote_ref: str,
             proxy: Optional[str]) -> None:
     """拉一次 manifest，确认这个镜像站真的提供服务，并记录 digest。"""
     try:
-        reg = Registry(c.url, image.path, timeout=timeout, retries=1, proxy=proxy)
+        reg = Registry(c.url, image.path, timeout=timeout, retries=1, proxy=c.effective_proxy)
         first = reg.fetch_manifest(remote_ref, retries=1)
         doc, mt = first["json"], first["media_type"]
         plat_digest = ""
@@ -854,7 +900,7 @@ def bench(c: Candidate, image: ImageRef, probe_bytes: int, proxy: Optional[str],
             if not c.platform_digest:
                 c.speed = 0.0
                 return
-            reg = Registry(c.url, image.path, timeout=timeout, retries=1, proxy=proxy)
+            reg = Registry(c.url, image.path, timeout=timeout, retries=1, proxy=c.effective_proxy)
             layers = reg.fetch_manifest(c.platform_digest, retries=1)["json"].get("layers") or []
         else:
             layers = mf.get("layers") or []
@@ -878,7 +924,7 @@ def bench(c: Candidate, image: ImageRef, probe_bytes: int, proxy: Optional[str],
         if time.monotonic() >= deadline:
             break
         try:
-            reg = Registry(c.url, image.path, timeout=timeout, retries=1, proxy=proxy)
+            reg = Registry(c.url, image.path, timeout=timeout, retries=1, proxy=c.effective_proxy)
             resp = reg.blob_response(digest, 0, want)
             got = 0
             t_first: Optional[float] = None
@@ -2675,6 +2721,10 @@ def cmd_pull(args: argparse.Namespace) -> int:
     upstream = args.upstream or (image.upstream_base if not image.is_hub else DEFAULT_UPSTREAM)
 
     mirror_proxy = args.proxy if args.proxy_all else None
+    apply_candidate_proxy(mirrors, mirror_proxy, args.proxy)
+    _px_used = sorted({c.effective_proxy for c in mirrors if c.effective_proxy})
+    if _px_used:
+        print("      代理: %s  (按 mirrors.json / --proxy-all 决定哪些站走)" % ", ".join(_px_used))
     winner, capable = select_fastest(
         mirrors, image, image.reference, os_, arch, variant,
         top_k=args.top_k, probe_bytes=args.probe_bytes, probe_timeout=args.probe_timeout,
@@ -2715,7 +2765,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     fetch_errors: List[str] = []
     for c in verified_chain:
         try:
-            reg = Registry(c.url, image.path, timeout=args.timeout, retries=2, proxy=mirror_proxy)
+            reg = Registry(c.url, image.path, timeout=args.timeout, retries=2, proxy=c.effective_proxy)
             first = reg.fetch_manifest(image.reference, retries=2)
             doc, mt = first["json"], first["media_type"]
             if is_index(doc, mt):
@@ -2787,7 +2837,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     # 下载用的镜像站链：拿到 manifest 的那个站排第一，其余作为故障转移后备
     blob_order = [winner] + [c for c in verified_chain if c is not winner]
     blob_regs = [Registry(c.url, image.path, timeout=args.timeout, retries=2,
-                          proxy=mirror_proxy) for c in blob_order]
+                          proxy=c.effective_proxy) for c in blob_order]
     blob_names = [c.name for c in blob_order]
     report["trust"]["download_chain"] = blob_names
     report["trust"]["manifest_source"] = winner.name
@@ -3113,6 +3163,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             eprint("提示: 未提供 --image 且旁边没有 .verify.json，跳过联网复核")
         else:
             mirrors = load_mirrors(args.mirrors_file, args.mirror, args.no_builtin_mirrors)
+            apply_candidate_proxy(mirrors, args.proxy if args.proxy_all else None, args.proxy)
             for c in mirrors:
                 handshake(c, args.probe_timeout)
             alive = [c for c in mirrors if c.rtt is not None]
@@ -3149,6 +3200,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     image = ImageRef(raw)
     print("dip %s  —  镜像站测速 (以 %s 为样本)" % (__version__, image))
     mirrors = load_mirrors(args.mirrors_file, args.mirror, args.no_builtin_mirrors)
+    apply_candidate_proxy(mirrors, args.proxy if args.proxy_all else None, args.proxy)
     os_, arch, variant = args.os, args.arch, args.variant
     t0 = time.time()
     winner, capable = select_fastest(
@@ -3175,6 +3227,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 def cmd_mirrors(args: argparse.Namespace) -> int:
     print("dip %s  —  镜像站候选" % __version__)
     mirrors = load_mirrors(args.mirrors_file, args.mirror, args.no_builtin_mirrors)
+    apply_candidate_proxy(mirrors, args.proxy if args.proxy_all else None, args.proxy)
     for c in mirrors:
         handshake(c, args.probe_timeout)
     for c in mirrors:
@@ -4068,8 +4121,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--no-builtin-mirrors", action="store_true", help="不使用内置镜像站列表")
         sp.add_argument("--upstream", metavar="URL",
                         help="官方 registry 地址（默认 https://registry-1.docker.io）")
-        sp.add_argument("--proxy", metavar="URL", help="代理（默认只用于官方源）")
+        sp.add_argument("--proxy", metavar="URL",
+                        help="代理（默认只用于官方源）；写 env 表示读环境变量")
         sp.add_argument("--proxy-all", action="store_true", help="代理也用于镜像站")
+        sp.add_argument("--proxy-from-env", action="store_true",
+                        help="从 https_proxy/http_proxy/all_proxy 读代理")
         sp.add_argument("--os", default="linux")
         sp.add_argument("--arch", default="amd64")
         sp.add_argument("--variant", default=None)
@@ -4151,6 +4207,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    p = getattr(args, "proxy", None)
+    if p == "env" or (getattr(args, "proxy_from_env", False) and not p):
+        args.proxy = env_proxy()
+        if not args.proxy:
+            eprint("错误: 环境变量里没有 https_proxy / http_proxy / all_proxy")
+            return 2
     try:
         return int(args.func(args) or 0)
     except DipError as e:

@@ -122,6 +122,69 @@ layer2/layer.tar
 
 ---
 
+## 镜像站清单与代理
+
+### 实测可用的站
+
+以下为本机 2026-11 直连实测结果。「Range」指能否按字节范围续传，直接决定大层能不能接着下。
+
+| 名称 | 地址 | Range | 说明 |
+|---|---|---|---|
+| daocloud | `https://docker.m.daocloud.io` | 支持 | 目前最稳；令牌 1 小时 |
+| 1ms | `https://docker.1ms.run` | 视缓存 | 未命中缓存的大层会回 200 |
+| rat.dev | `https://hub.rat.dev` | 视缓存 | 302 跳到 `docker.1ms.run`，实为同一后端 |
+| 1panel | `https://docker.1panel.live` | 视缓存 | 时通时不通，可作补充带宽 |
+| dockerproxy | `https://dockerproxy.net` | 不支持 | 测速最快，但只能贡献新下载的带宽，永远不参与续传 |
+
+需要代理才能用：
+
+| 名称 | 地址 | 说明 |
+|---|---|---|
+| gcr-mirror | `https://mirror.gcr.io` | Google 的 Docker Hub 拉取缓存，`library/*` 与普通镜像都能取，digest 与官方一致 |
+| upstream | `https://registry-1.docker.io` | 官方源。本机直连 90 秒超时，走代理 2 秒内可达 |
+
+不适用或已失效：`public.ecr.aws` 必须把仓库名改成 `docker/library/xxx`，不是可直接替换的镜像站；
+`dockerpull.com`、`docker.rainbond.cc`、`hub.fast360.xyz`、`docker.xuanyuan.me`、`docker.nju.edu.cn`（403）、
+中科大/上交/网易的旧镜像均已不可用。
+
+**同一个站对不同的层可能表现不同。** 小层命中缓存时回 206，大层回源时可能回 200。
+所以工具是**按每个 blob 现场探测**，不是给站点贴一次性标签。
+
+### 代理怎么配
+
+`dip` 默认**不使用**系统代理：本机环境里的 `http_proxy` 常年指向一个不通的端口，
+隐式采用会把所有请求带进沟里。要用代理必须显式指定。
+
+| 场景 | 用法 |
+|---|---|
+| 只让官方源走代理（最常用） | `--proxy http://127.0.0.1:7890` |
+| 镜像站也全部走代理 | `--proxy http://127.0.0.1:7890 --proxy-all` |
+| 从环境变量读取 | `--proxy env` 或 `--proxy-from-env`，优先级 `https_proxy` > `http_proxy` > `all_proxy` |
+| 国内直连、国外站单独走代理 | 在 `mirrors.json` 里给那条写 `"proxy": true` |
+
+`mirrors.json` 里每条站支持三种代理设置：
+
+```json
+{ "name": "daocloud",   "url": "https://docker.m.daocloud.io", "proxy": false }
+{ "name": "gcr-mirror", "url": "https://mirror.gcr.io",        "proxy": true }
+{ "name": "内网Harbor",  "url": "https://harbor.internal",      "proxy": "http://10.0.0.1:3128" }
+```
+
+- `false`：这条永不走代理，适合国内站和内网 registry
+- `true`：这条走 `--proxy` 指定的代理；没给就退回环境变量
+- 字符串：这条固定走这个代理地址
+
+验证代理是否真的通，用不下载的探测：
+
+```bash
+python dip.py mirrors --proxy http://127.0.0.1:7890
+python dip.py pull nginx:1.27 -o nginx.tar.gz --plan-only --proxy http://127.0.0.1:7890
+```
+
+第一条列出每个候选站的握手耗时，第二条把选站、测速、与官方源比对完整跑一遍但不下载。
+
+---
+
 ## 完整性是怎么保证的
 
 三层校验，互相独立，**任何一层不过就不交付**：
@@ -178,6 +241,9 @@ python dip.py pull nginx:1.27 --upstream https://your-harbor    # 用内网源�
 --mirror URL                追加镜像站并排到最前，可重复
 --no-builtin-mirrors        只用自己指定的站
 --mirrors-file PATH         镜像站配置（默认自动找 ./mirrors.json）
+--proxy URL                 代理，默认只用于官方源；写 env 表示读环境变量
+--proxy-all                 代理也用于镜像站
+--proxy-from-env            从 https_proxy / http_proxy / all_proxy 读代理
 --compress gzip|none        外层压缩（默认 gzip）
 --compress-level 0-9        gzip 级别，默认 6，调低更快
 --work-dir DIR              临时目录，建议指向大容量盘
