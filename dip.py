@@ -53,6 +53,10 @@ dip - Docker Image Puller
    --proxy 只作用于官方源，--proxy-all 才作用于镜像站；mirrors.json 里每条站
    可写 proxy: true/false/"URL" 单独覆盖，实现「国内直连 + 国外走代理」。
    默认不读系统代理：本机 http_proxy 常指向死端口，隐式采用会把请求全带进沟里。
+8. 失败分层重试，且预算按「连续无进展」而非「次数」算：单请求 -> 单 blob
+   （默认 20 次）-> 整层补下（默认 2 轮）-> manifest 多轮跨站。几 GB 的层
+   在时通时断的链路上，连续失败十几次仍应能下完；但只要每次能往前挪一点，
+   预算就不消耗。只有 404 这类确定性错误不做重试。
 """
 
 from __future__ import annotations
@@ -79,7 +83,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 UA = "dip/%s (+docker-registry-v2-client)" % __version__
 
 # --------------------------------------------------------------------------
@@ -103,6 +107,13 @@ MANIFEST_ACCEPT = ",".join(
 )
 
 RETRY_HTTP_CODES = (429, 500, 502, 503, 504)
+
+# 失败预算：按「连续无进展」计，而不是按次数计。链路本来就会抽风，几次失败
+# 不代表没救；只要还在进字节就该继续试。这几个值决定「什么时候才认输」。
+DEFAULT_NO_PROGRESS = 20        # 连续 20 次毫无进展才放弃（旧值 8/10）
+SEG_STALL_SECONDS = 240.0       # 或者连续 4 分钟一个新字节都没进
+SEG_ATTEMPT_HARD_CAP = 400      # 纯防死循环的硬上限
+LAYER_RETRY_ROUNDS = 2          # 整层失败后再补下几轮
 
 DEFAULT_UPSTREAM = "https://registry-1.docker.io"
 
@@ -1737,7 +1748,7 @@ def download_blob(
     idle_timeout: float = 45.0,
     names: Optional[List[str]] = None,
     resume_cooldown: float = GOV_RESUME_COOLDOWN,
-    no_progress_limit: int = 10,
+    no_progress_limit: int = DEFAULT_NO_PROGRESS,
 ) -> int:
     """断点续传式下载一个 blob，边下边报进度。返回字节数。
 
@@ -2128,6 +2139,8 @@ def download_blob_multisource(
     cooldown: float = GOV_RESUME_COOLDOWN,
     gov_log: Optional[Callable[[str], None]] = None,
     stats: Optional[Dict[str, Any]] = None,
+    no_progress_limit: int = DEFAULT_NO_PROGRESS,
+    stall_seconds: float = SEG_STALL_SECONDS,
 ) -> int:
     """多源分片并行下载：把一个 blob 切成若干段，同时从多个镜像站各拉一段。
 
@@ -2158,7 +2171,8 @@ def download_blob_multisource(
     if sources <= 1 or len(registries) <= 1:
         return download_blob(registries, digest, dest, label, progress, key,
                              expected_size, max_retries, idle_timeout, names,
-                             resume_cooldown=cooldown)
+                             resume_cooldown=cooldown,
+                             no_progress_limit=no_progress_limit)
 
     # ---- 1) 问出总长度（Range 0-0） ----
     total = int(expected_size or 0)
@@ -2174,7 +2188,8 @@ def download_blob_multisource(
     if total < SEG_MIN_BYTES:
         return download_blob(registries, digest, dest, label, progress, key,
                              expected_size, max_retries, idle_timeout, names,
-                             resume_cooldown=cooldown)
+                             resume_cooldown=cooldown,
+                             no_progress_limit=no_progress_limit)
 
     # ---- 2) 划段 ----
     n_src = max(1, min(sources, len(registries), MAX_SOURCES))
@@ -2184,7 +2199,8 @@ def download_blob_multisource(
     if len(ranges) <= 1:
         return download_blob(registries, digest, dest, label, progress, key,
                              expected_size, max_retries, idle_timeout, names,
-                             resume_cooldown=cooldown)
+                             resume_cooldown=cooldown,
+                             no_progress_limit=no_progress_limit)
     seg_paths = [dest + ".seg%02d" % i for i in range(len(ranges))]
     # 上一次运行留下的分片状态。有这个，就不能再退回单流：单流只认 `.part`，
     # 会把已经下好的几个 GB 当成不存在 —— 实测就是这样把 83% 的进度丢掉的。
@@ -2217,7 +2233,8 @@ def download_blob_multisource(
                           % (label, human_bytes(got)), flush=True)
             return download_blob(regs, digest, dest, label, progress, key,
                                  expected_size, max_retries, idle_timeout, nm,
-                                 resume_cooldown=cooldown)
+                                 resume_cooldown=cooldown,
+                                 no_progress_limit=no_progress_limit)
         keep_idx = [k for k, _, _ in kept]
         regs = [r for _, r, _ in kept]
         nm = [t for _, _, t in kept]
@@ -2232,7 +2249,8 @@ def download_blob_multisource(
         if len(regs) <= 1 and not has_seg_state:
             return download_blob(regs, digest, dest, label, progress, key,
                                  expected_size, max_retries, idle_timeout, nm,
-                                 resume_cooldown=cooldown)
+                                 resume_cooldown=cooldown,
+                                 no_progress_limit=no_progress_limit)
         n_src = max(1, min(n_src, len(regs)))
 
     # ---- 接管单流时代留下的 .part，当作前几片的已有前缀 ----
@@ -2308,9 +2326,32 @@ def download_blob_multisource(
             last: Optional[BaseException] = None
             ok = False
             attempts = 0
+            idle = 0                     # 连续「毫无进展」次数
             kill_hits = 0
-            while not abort.is_set() and attempts < max_retries:
+            last_size = os.path.getsize(path) if os.path.exists(path) else 0
+            stall_since = time.monotonic()
+
+            def _after_error() -> None:
+                """失败后重新记账：只要分片长过，就认为仍在推进，预算清零。"""
+                nonlocal last_size, idle, stall_since
+                cur = os.path.getsize(path) if os.path.exists(path) else 0
+                if cur > last_size:
+                    idle = 0
+                    stall_since = time.monotonic()
+                else:
+                    idle += 1
+                last_size = cur
+
+            while not abort.is_set():
                 check_cancel()
+                if idle >= no_progress_limit:
+                    last = last or DipError("连续 %d 次毫无进展" % idle)
+                    break
+                if time.monotonic() - stall_since >= stall_seconds:
+                    last = last or DipError("连续 %.0fs 没有新字节" % stall_seconds)
+                    break
+                if attempts >= SEG_ATTEMPT_HARD_CAP:
+                    break
                 if gov is not None:
                     ri = gov.acquire(timeout=1.0)
                     if ri is None:
@@ -2338,6 +2379,8 @@ def download_blob_multisource(
                     if gov is not None:
                         gov.note_kill(ri)
                     kill_hits += 1
+                    _after_error()
+                    idle = max(0, idle - 1)      # 池子调度不是错误，不消耗预算
                     have_now = os.path.getsize(path) if os.path.exists(path) else 0
                     print("      %s: 源 %s 已判定过慢被关闭，片 %d/%d 转由其它源续传"
                           "（已收 %s）" % (label, e, si + 1, len(ranges),
@@ -2363,6 +2406,7 @@ def download_blob_multisource(
                     print("      %s: %s %s，已移出源池（还剩 %d 个源，分片保留）"
                           % (label, nm[ri], e, len(usable)), flush=True)
                     last = e
+                    _after_error()
                     if gov is None:
                         attempts += 1
                     continue
@@ -2374,9 +2418,12 @@ def download_blob_multisource(
                         reg.clear_tokens()
                     if gov is not None:
                         gov.fail(ri, _err_kind(e))
+                    _after_error()
                     print("      片 %d/%d 在 %s 上失败(%s)，换源重试"
-                          % (si + 1, len(ranges), nm[ri], type(e).__name__), flush=True)
-                    time.sleep(min(2 ** attempts, 8))
+                          "（连续无进展 %d/%d 次）"
+                          % (si + 1, len(ranges), nm[ri], type(e).__name__,
+                             idle, no_progress_limit), flush=True)
+                    time.sleep(min(2 ** min(attempts, 4), 15))
                     continue
                 finally:
                     if gov is not None:
@@ -2385,7 +2432,8 @@ def download_blob_multisource(
                 continue
             if abort.is_set():
                 return
-            errors.append("片 %d/%d: %s" % (si + 1, len(ranges), last or "未知原因"))
+            errors.append("片 %d/%d: %s（重试 %d 次，连续无进展 %d 次）"
+                          % (si + 1, len(ranges), last or "未知原因", attempts, idle))
             abort.set()
             return
 
@@ -2425,7 +2473,8 @@ def download_blob_multisource(
     if unsupported.is_set():
         return download_blob(registries, digest, dest, label, progress, key,
                              expected_size, max_retries, idle_timeout, names,
-                             resume_cooldown=cooldown)
+                             resume_cooldown=cooldown,
+                             no_progress_limit=no_progress_limit)
     if errors:
         raise DipError("blob %s 多源分片下载失败:\n  %s"
                        % (digest[:19], "\n  ".join(errors[:4])))
@@ -2763,31 +2812,45 @@ def cmd_pull(args: argparse.Namespace) -> int:
     platform_manifest_digest = ""
     platform_manifest_computed = ""
     fetch_errors: List[str] = []
-    for c in verified_chain:
-        try:
-            reg = Registry(c.url, image.path, timeout=args.timeout, retries=2, proxy=c.effective_proxy)
-            first = reg.fetch_manifest(image.reference, retries=2)
-            doc, mt = first["json"], first["media_type"]
-            if is_index(doc, mt):
-                entry = pick_platform(doc, os_, arch, variant)
-                chosen = reg.fetch_manifest(entry["digest"], retries=2)
-                mf = chosen["json"]
-                platform_manifest_digest = chosen["digest_header"] or chosen["digest_computed"]
-                platform_manifest_computed = chosen["digest_computed"]
-            else:
-                mf = doc
-                platform_manifest_digest = first["digest_header"] or first["digest_computed"]
-                platform_manifest_computed = first["digest_computed"]
-            if c is not winner:
-                print("      manifest 改从 %s 获取（%s 不可用）" % (c.name, winner.name))
-                winner = c
+    # 取 manifest 也按「多轮 + 多站」重试。这一步在下载之前，一旦失败整轮拉取
+    # 就直接退出，用户只能手工重敲命令 —— 在时通时断的链路上单轮失败率并不低。
+    for _mf_round in range(3):
+        if _mf_round:
+            print("      manifest 第 %d/3 轮重试（上一轮全部失败）" % (_mf_round + 1),
+                  flush=True)
+            time.sleep(4.0 * _mf_round)
+            fetch_errors = []
+        for c in verified_chain:
+            try:
+                reg = Registry(c.url, image.path, timeout=args.timeout, retries=2,
+                               proxy=c.effective_proxy)
+                first = reg.fetch_manifest(image.reference, retries=2)
+                doc, mt = first["json"], first["media_type"]
+                if is_index(doc, mt):
+                    entry = pick_platform(doc, os_, arch, variant)
+                    chosen = reg.fetch_manifest(entry["digest"], retries=2)
+                    mf = chosen["json"]
+                    platform_manifest_digest = (chosen["digest_header"]
+                                                or chosen["digest_computed"])
+                    platform_manifest_computed = chosen["digest_computed"]
+                else:
+                    mf = doc
+                    platform_manifest_digest = (first["digest_header"]
+                                                or first["digest_computed"])
+                    platform_manifest_computed = first["digest_computed"]
+                if c is not winner:
+                    print("      manifest 改从 %s 获取（%s 不可用）" % (c.name, winner.name))
+                    winner = c
+                break
+            except Exception as e:  # noqa: BLE001
+                fetch_errors.append("%s: %s" % (c.name, type(e).__name__))
+                first = mf = None
+                continue
+        if mf is not None:
             break
-        except Exception as e:  # noqa: BLE001
-            fetch_errors.append("%s: %s" % (c.name, type(e).__name__))
-            first = mf = None
-            continue
     if first is None or mf is None:
-        raise DipError("所有镜像站都拿不到 manifest:\n  " + "\n  ".join(fetch_errors))
+        raise DipError("所有镜像站都拿不到 manifest（已重试 3 轮）:\n  "
+                       + "\n  ".join(fetch_errors))
 
     config_descriptor = mf.get("config") or {}
     config_digest = config_descriptor.get("digest")
@@ -2892,6 +2955,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
             "resume_cooldown_sec": cooldown,
         },
     }
+    retry_budget = max(1, int(getattr(args, "retries", DEFAULT_NO_PROGRESS)
+                              or DEFAULT_NO_PROGRESS))
     gov_lock = threading.Lock()
     gov_events: List[Dict[str, Any]] = []
     try:
@@ -2899,7 +2964,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
         cfg_path = os.path.join(blob_dir, "config.blob")
         download_blob(blob_regs, config_digest, cfg_path, "config", progress, "cfg",
                       expected_size=config_descriptor.get("size"), names=blob_names,
-                      resume_cooldown=cooldown)
+                      resume_cooldown=cooldown, no_progress_limit=retry_budget)
         with open(cfg_path, "rb") as f:
             config_bytes = f.read()
         alg, expect_hex = split_digest(config_digest)
@@ -2927,7 +2992,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
                                           use_governor=use_gov,
                                           slow_ratio=slow_ratio, min_rate=min_rate,
                                           cooldown=cooldown,
-                                          gov_log=_gov_log, stats=gov_stats)
+                                          gov_log=_gov_log, stats=gov_stats,
+                                          no_progress_limit=retry_budget)
             except Exception as e:  # noqa: BLE001
                 progress.finish(key, "失败")
                 if gov_stats.get("governor"):
@@ -2942,14 +3008,39 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
         results: Dict[int, Tuple[str, str]] = {}
         errors: List[str] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=layer_jobs) as ex:
-            futs = {ex.submit(job, (i, l)): i for i, l in enumerate(layers, 1)}
-            for fut in concurrent.futures.as_completed(futs):
-                try:
-                    i, dg, dest = fut.result()
-                    results[i] = (dg, dest)
-                except Exception as e:  # noqa: BLE001
-                    errors.append("%s" % e)
+
+        def run_layer_pass(items: List[Tuple[int, Dict[str, Any]]]) -> None:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=layer_jobs) as ex:
+                futs = {ex.submit(job, (i, l)): i for i, l in enumerate(items, 1)}
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        i, dg, dest = fut.result()
+                        results[i] = (dg, dest)
+                    except Exception as e:  # noqa: BLE001
+                        errors.append("%s" % e)
+
+        run_layer_pass([(i, l) for i, l in enumerate(layers, 1)])
+
+        # 整层补下：一个 4.7GB 的层可能已经下到 90%，一次抖动就整张图失败太亏。
+        # 重新构造 Registry 还有个副作用是好的：上一轮被标记 range_ok=False 的站
+        # 会重新获得机会 —— Range 是「按 blob」的属性，换个层可能就支持了。
+        layer_rounds = max(0, int(getattr(args, "layer_retries", LAYER_RETRY_ROUNDS)
+                                  if getattr(args, "layer_retries", None) is not None
+                                  else LAYER_RETRY_ROUNDS))
+        for rnd in range(1, layer_rounds + 1):
+            if not errors:
+                break
+            pending_layers = [(i, l) for i, l in enumerate(layers, 1)
+                              if i not in results]
+            if not pending_layers:
+                break
+            print("      第 %d/%d 轮补下：%d 个层上次失败，换新连接重试"
+                  % (rnd, layer_rounds, len(pending_layers)), flush=True)
+            time.sleep(min(10.0 * rnd, 30.0))
+            errors = []
+            blob_regs = [Registry(c.url, image.path, timeout=args.timeout, retries=2,
+                                  proxy=c.effective_proxy) for c in blob_order]
+            run_layer_pass(pending_layers)
         # 某层下载失败不一定致命：它的 layer.tar 可能早已解压好并通过校验
         # （典型的「打包/解压阶段中断」场景）。这里只对**确实还没搞定**的层报错，
         # 已经能靠 tar 复用的层放行 —— 否则已有的成果又会被整体放弃。
@@ -4126,6 +4217,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--proxy-all", action="store_true", help="代理也用于镜像站")
         sp.add_argument("--proxy-from-env", action="store_true",
                         help="从 https_proxy/http_proxy/all_proxy 读代理")
+        sp.add_argument("--retries", type=int, default=DEFAULT_NO_PROGRESS,
+                        help="连续多少次毫无进展才放弃（默认 %d）" % DEFAULT_NO_PROGRESS)
+        sp.add_argument("--layer-retries", type=int, default=LAYER_RETRY_ROUNDS,
+                        help="整层失败后补下几轮（默认 %d，0 表示不补）"
+                             % LAYER_RETRY_ROUNDS)
         sp.add_argument("--os", default="linux")
         sp.add_argument("--arch", default="amd64")
         sp.add_argument("--variant", default=None)
