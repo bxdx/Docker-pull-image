@@ -3011,7 +3011,9 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
         def run_layer_pass(items: List[Tuple[int, Dict[str, Any]]]) -> None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=layer_jobs) as ex:
-                futs = {ex.submit(job, (i, l)): i for i, l in enumerate(items, 1)}
+                # items 已经是 (层号, 层描述) 元组，直接解包 —— 不能再套 enumerate，
+                # 否则 i 会变成 1..N 的序号、l 变成元组，job 里 l["digest"] 直接炸。
+                futs = {ex.submit(job, (ti, tl)): ti for ti, tl in items}
                 for fut in concurrent.futures.as_completed(futs):
                     try:
                         i, dg, dest = fut.result()
